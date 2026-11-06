@@ -61,7 +61,14 @@ const char *SETUP_AP_PASSWORD = "12345678";    // at least 8 characters
 #define WIFI_CONNECT_TIMEOUT_MS 20000          // try known networks this long before opening the setup Wi-Fi
 #define SETUP_PORTAL_TIMEOUT_MS 300000         // close the setup Wi-Fi after 5 minutes and try again
 
-const char *SERVER_BASE   = "http://YOUR_SERVER_IP:8009";
+// Server addresses, tried in order at start-up; the first one that answers is used.
+// Inside the lab, the public address often does NOT work (the router cannot loop back to
+// itself), so also put the LAN address of the server PC here (run "ipconfig" on that PC).
+static const char *SERVER_CANDIDATES[] = {
+    "http://YOUR_SERVER_IP:8009",      // public address (works from outside the lab)
+    // "http://192.168.1.100:8009",    // LAN address of the server PC: fill in and remove the //
+};
+static String SERVER_BASE = SERVER_CANDIDATES[0];
 const char *INTERACT_PATH = "/api/v1/voice/interact";
 const char *HEALTH_PATH   = "/api/v1/health";
 const char *VOICE_NAME    = "";        // empty = server default voice
@@ -1186,7 +1193,7 @@ static bool send_and_play(size_t samples) {
     http.useHTTP10(true);              // no chunked encoding -> simple raw stream
     http.setConnectTimeout(10000);
     http.setTimeout(HTTP_TIMEOUT_MS);
-    http.begin(String(SERVER_BASE) + INTERACT_PATH);
+    http.begin(SERVER_BASE + INTERACT_PATH);
     http.addHeader("Content-Type", String("multipart/form-data; boundary=") + BOUNDARY);
     const char *wanted_headers[] = {"Content-Type", "X-Transcript", "X-Response-Text"};
     http.collectHeaders(wanted_headers, 3);
@@ -1207,7 +1214,7 @@ static bool send_and_play(size_t samples) {
             http.end();
             String path = find_audio_path(body);
             if (path.length()) {
-                ok = fetch_and_play(String(SERVER_BASE) + path);
+                ok = fetch_and_play(SERVER_BASE + path);
             } else {
                 Serial.println("[HTTP] No audio link found in JSON.");
             }
@@ -1218,6 +1225,9 @@ static bool send_and_play(size_t samples) {
         Serial.println("[HTTP] Error body: " + http.getString());
     } else {
         Serial.printf("[HTTP] Request failed: %s\n", http.errorToString(code).c_str());
+        http.end();
+        select_server();   // the network may have changed: look for an address that answers
+        return false;
     }
     http.end();
     return ok;
@@ -1382,13 +1392,27 @@ static void connect_wifi() {
     }
 }
 
-static void check_server() {
-    HTTPClient http;
-    http.setTimeout(10000);
-    http.begin(String(SERVER_BASE) + HEALTH_PATH);
-    int code = http.GET();
-    Serial.printf("[SERVER] Health check: %d %s\n", code, code > 0 ? http.getString().c_str() : "");
-    http.end();
+// Finds a server address that answers. Returns true if one was found.
+static bool select_server() {
+    size_t count = sizeof(SERVER_CANDIDATES) / sizeof(SERVER_CANDIDATES[0]);
+    for (size_t i = 0; i < count; i++) {
+        HTTPClient http;
+        http.setConnectTimeout(4000);
+        http.setTimeout(6000);
+        http.begin(String(SERVER_CANDIDATES[i]) + HEALTH_PATH);
+        int code = http.GET();
+        String body = code > 0 ? http.getString() : http.errorToString(code);
+        http.end();
+        Serial.printf("[SERVER] %s -> %d %s\n", SERVER_CANDIDATES[i], code, body.substring(0, 120).c_str());
+        if (code == 200) {
+            SERVER_BASE = SERVER_CANDIDATES[i];
+            Serial.printf("[SERVER] Using %s\n", SERVER_BASE.c_str());
+            return true;
+        }
+    }
+    SERVER_BASE = SERVER_CANDIDATES[0];
+    Serial.println("[SERVER] WARNING: no server address answers. Check that the server is on, and add its LAN address to SERVER_CANDIDATES.");
+    return false;
 }
 
 // ===================== Spoken prompts (goodbye) =====================
@@ -1446,7 +1470,7 @@ static bool fetch_prompt(const char *text, const char *path) {
         HTTPClient http;
         http.useHTTP10(true);
         http.setTimeout(HTTP_TIMEOUT_MS);
-        http.begin(String(SERVER_BASE) + TTS_PATH);
+        http.begin(SERVER_BASE + TTS_PATH);
         http.addHeader("Content-Type", "application/json");
         const char *wanted_headers[] = {"Content-Type"};
         http.collectHeaders(wanted_headers, 1);
@@ -1474,7 +1498,7 @@ static bool fetch_prompt(const char *text, const char *path) {
     {
         HTTPClient http;
         http.setTimeout(HTTP_TIMEOUT_MS);
-        http.begin(String(SERVER_BASE) + CHAT_PATH);
+        http.begin(SERVER_BASE + CHAT_PATH);
         http.addHeader("Content-Type", "application/json");
         String message = String("Hãy đọc lại nguyên văn câu sau, không thêm hay bớt chữ nào: ") + text;
         String body = String("{\"message\":\"") + json_escape(message.c_str()) + "\",\"synthesize_speech\":true,\"voice\":" + voice + "}";
@@ -1488,7 +1512,7 @@ static bool fetch_prompt(const char *text, const char *path) {
             Serial.println("[VOICE] No audio link in the chat reply.");
             return false;
         }
-        if (download_wav(String(SERVER_BASE) + audio, path)) {
+        if (download_wav(SERVER_BASE + audio, path)) {
             Serial.println("[VOICE] Goodbye sound made with the chat endpoint");
             return true;
         }
@@ -1604,7 +1628,11 @@ void setup() {
         run_setup_portal();
     }
     connect_wifi();
-    check_server();
+    if (!select_server()) {
+        set_state(FACE_ERROR);
+        play_error_sound();
+        delay(1500);
+    }
     prepare_prompts();
     calibrate_noise();
 }
