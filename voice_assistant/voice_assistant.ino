@@ -58,6 +58,9 @@ static const KnownWifi KNOWN_WIFI[] = {
 // Wi-Fi "Tiva-Setup": join it with a phone, a page opens, pick the new network.
 const char *SETUP_AP_NAME     = "Tiva-Setup";
 const char *SETUP_AP_PASSWORD = "12345678";    // at least 8 characters
+// Wi-Fi transmit power. Low power = weak, slow uploads far from the router (error -3).
+// If the board cannot connect or restarts by itself, lower it to WIFI_POWER_8_5dBm.
+#define WIFI_TX_POWER           WIFI_POWER_15dBm
 #define WIFI_CONNECT_TIMEOUT_MS 20000          // try known networks this long before opening the setup Wi-Fi
 #define SETUP_PORTAL_TIMEOUT_MS 300000         // close the setup Wi-Fi after 5 minutes and try again
 
@@ -65,7 +68,7 @@ const char *SETUP_AP_PASSWORD = "12345678";    // at least 8 characters
 // Inside the lab, the public address often does NOT work (the router cannot loop back to
 // itself), so also put the LAN address of the server PC here (run "ipconfig" on that PC).
 static const char *SERVER_CANDIDATES[] = {
-    "http://YOUR_SERVER_IP:8009",      // public address (works from outside the lab)
+    "http://YOUR_SERVER_IP:8009",
     // "http://192.168.1.100:8009",    // LAN address of the server PC: fill in and remove the //
 };
 static String SERVER_BASE = SERVER_CANDIDATES[0];
@@ -1178,6 +1181,124 @@ static bool fetch_and_play(const String &url) {
     return ok;
 }
 
+// Splits "http://host:port" into host and port
+static void parse_server(const String &base, String &host, uint16_t &port) {
+    String rest = base.startsWith("http://") ? base.substring(7) : base;
+    int slash = rest.indexOf('/');
+    if (slash >= 0) rest = rest.substring(0, slash);
+    int colon = rest.indexOf(':');
+    host = colon >= 0 ? rest.substring(0, colon) : rest;
+    port = colon >= 0 ? (uint16_t)rest.substring(colon + 1).toInt() : 80;
+}
+
+// Writes everything, in small pieces, waiting while the Wi-Fi is slow (stops after 15 s without progress)
+static bool write_all(WiFiClient &client, const uint8_t *data, size_t len) {
+    size_t sent = 0;
+    uint32_t last_progress = millis();
+    while (sent < len) {
+        if (!client.connected()) return false;
+        size_t piece = min((size_t)2048, len - sent);
+        size_t n = client.write(data + sent, piece);
+        if (n > 0) {
+            sent += n;
+            last_progress = millis();
+        } else {
+            if (millis() - last_progress > 15000) return false;
+            delay(10);
+        }
+    }
+    return true;
+}
+
+// Reads one header line (without \r\n). Returns false on timeout.
+static bool read_line(WiFiClient &client, String &line, uint32_t timeout_ms) {
+    line = "";
+    uint32_t start = millis();
+    while (millis() - start < timeout_ms) {
+        while (client.available()) {
+            char c = client.read();
+            if (c == '\n') return true;
+            if (c != '\r') line += c;
+        }
+        if (!client.connected() && !client.available()) return line.length() > 0;
+        delay(2);
+    }
+    return false;
+}
+
+// Uploads the recording once. Returns: 1 = played the answer, 0 = server answered but failed, -1 = network problem
+static int upload_and_play(size_t total) {
+    String host;
+    uint16_t port;
+    parse_server(SERVER_BASE, host, port);
+    uint32_t t0 = millis();
+
+    WiFiClient client;
+    client.setNoDelay(true);
+    if (!client.connect(host.c_str(), port, 8000)) {
+        Serial.printf("[HTTP] Cannot connect to %s:%u\n", host.c_str(), port);
+        return -1;
+    }
+
+    // HTTP/1.0 = the server answers with a plain stream (no chunked encoding) and closes at the end
+    String head = String("POST ") + INTERACT_PATH + " HTTP/1.0\r\n" +
+                  "Host: " + host + ":" + String(port) + "\r\n" +
+                  "Content-Type: multipart/form-data; boundary=" + BOUNDARY + "\r\n" +
+                  "Content-Length: " + String((unsigned)total) + "\r\n" +
+                  "Connection: close\r\n\r\n";
+    if (!write_all(client, (const uint8_t *)head.c_str(), head.length()) || !write_all(client, upload_buffer, total)) {
+        Serial.printf("[HTTP] Upload stopped after %.1f s (weak Wi-Fi or the server closed the connection)\n",
+                      (millis() - t0) / 1000.0f);
+        client.stop();
+        return -1;
+    }
+    Serial.printf("[HTTP] Sent in %.1f s, waiting for the answer...\n", (millis() - t0) / 1000.0f);
+
+    // Status line + headers
+    String line;
+    if (!read_line(client, line, HTTP_TIMEOUT_MS)) {
+        Serial.println("[HTTP] No answer from the server (timeout)");
+        client.stop();
+        return -1;
+    }
+    int code = line.length() > 12 ? line.substring(9, 12).toInt() : 0;
+    String content_type, transcript, reply_text;
+    while (read_line(client, line, 10000) && line.length() > 0) {
+        String lower = line;
+        lower.toLowerCase();
+        String value = line.substring(line.indexOf(':') + 1);
+        value.trim();
+        if (lower.startsWith("content-type:")) content_type = value;
+        else if (lower.startsWith("x-transcript:")) transcript = value;
+        else if (lower.startsWith("x-response-text:")) reply_text = value;
+    }
+    Serial.printf("[HTTP] Status %d after %.1f s, Content-Type: %s\n", code, (millis() - t0) / 1000.0f, content_type.c_str());
+    if (transcript.length()) Serial.println("[YOU]   " + transcript);
+    if (reply_text.length()) Serial.println("[ROBOT] " + reply_text);
+
+    int result = 0;
+    if (code == 200 && content_type.indexOf("json") >= 0) {
+        String body = client.readString();
+        Serial.println("[HTTP] JSON: " + body.substring(0, 600));
+        client.stop();
+        String path = find_audio_path(body);
+        if (path.length()) {
+            result = fetch_and_play(SERVER_BASE + path) ? 1 : 0;
+        } else {
+            Serial.println("[HTTP] No audio link found in JSON.");
+        }
+        return result;
+    }
+    if (code == 200) {
+        result = play_wav(&client, &client) ? 1 : 0;
+    } else {
+        String body = client.readString();
+        Serial.printf("[HTTP] Error %d: %s\n", code, body.substring(0, 600).c_str());
+    }
+    client.stop();
+    return result;
+}
+
 static bool send_and_play(size_t samples) {
     size_t pcm_bytes = samples * sizeof(int16_t);
     size_t prefix_len = multipart_prefix.length();
@@ -1186,51 +1307,19 @@ static bool send_and_play(size_t samples) {
     size_t total = pcm_offset + pcm_bytes + multipart_tail.length();
 
     set_state(FACE_THINKING);
-    Serial.printf("[HTTP] Uploading %u bytes to server...\n", (unsigned)total);
-    uint32_t t0 = millis();
+    Serial.printf("[HTTP] Uploading %u bytes to %s (Wi-Fi signal %d dBm)...\n",
+                  (unsigned)total, SERVER_BASE.c_str(), (int)WiFi.RSSI());
 
-    HTTPClient http;
-    http.useHTTP10(true);              // no chunked encoding -> simple raw stream
-    http.setConnectTimeout(10000);
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    http.begin(SERVER_BASE + INTERACT_PATH);
-    http.addHeader("Content-Type", String("multipart/form-data; boundary=") + BOUNDARY);
-    const char *wanted_headers[] = {"Content-Type", "X-Transcript", "X-Response-Text"};
-    http.collectHeaders(wanted_headers, 3);
-
-    int code = http.POST(upload_buffer, total);
-    Serial.printf("[HTTP] Status %d after %.1f s\n", code, (millis() - t0) / 1000.0f);
-
-    bool ok = false;
-    if (code == 200) {
-        String content_type = http.header("Content-Type");
-        Serial.printf("[HTTP] Content-Type: %s\n", content_type.c_str());
-        if (http.header("X-Transcript").length()) Serial.println("[YOU]   " + http.header("X-Transcript"));
-        if (http.header("X-Response-Text").length()) Serial.println("[ROBOT] " + http.header("X-Response-Text"));
-
-        if (content_type.indexOf("json") >= 0) {
-            String body = http.getString();
-            Serial.println("[HTTP] JSON: " + body);
-            http.end();
-            String path = find_audio_path(body);
-            if (path.length()) {
-                ok = fetch_and_play(SERVER_BASE + path);
-            } else {
-                Serial.println("[HTTP] No audio link found in JSON.");
-            }
-            return ok;
+    int result = upload_and_play(total);
+    if (result < 0) {
+        // Network problem: find an address that answers, then try once more
+        if (select_server()) {
+            Serial.println("[HTTP] Retrying...");
+            set_state(FACE_THINKING);
+            result = upload_and_play(total);
         }
-        ok = play_wav(http.getStreamPtr(), http.getStreamPtr());
-    } else if (code > 0) {
-        Serial.println("[HTTP] Error body: " + http.getString());
-    } else {
-        Serial.printf("[HTTP] Request failed: %s\n", http.errorToString(code).c_str());
-        http.end();
-        select_server();   // the network may have changed: look for an address that answers
-        return false;
     }
-    http.end();
-    return ok;
+    return result > 0;
 }
 
 // ===================== Wi-Fi =====================
@@ -1262,7 +1351,7 @@ static bool try_known_networks(uint32_t timeout_ms) {
     WiFi.setSleep(false);
     // Mini ESP32-S3 boards have a tiny antenna / weak regulator:
     // full TX power often makes Wi-Fi fail or resets the board (brownout).
-    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.setTxPower(WIFI_TX_POWER);
     add_known_networks();
 
     uint32_t start = millis();
@@ -1270,7 +1359,7 @@ static bool try_known_networks(uint32_t timeout_ms) {
     Serial.print("[WIFI] Connecting");
     while (millis() - start < timeout_ms) {
         if (wifi_multi.run(4000) == WL_CONNECTED) {
-            WiFi.setTxPower(WIFI_POWER_8_5dBm);
+            WiFi.setTxPower(WIFI_TX_POWER);
             Serial.printf("\n[WIFI] Connected to \"%s\", IP: %s, signal %d dBm\n",
                           WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
             return true;
@@ -1321,7 +1410,7 @@ static void run_setup_portal() {
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP_STA);
-    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.setTxPower(WIFI_TX_POWER);
 
     // List nearby networks for the drop-down
     String options;
